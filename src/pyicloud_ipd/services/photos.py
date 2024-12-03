@@ -508,7 +508,14 @@ class PhotoAlbum(object):
                 u'captionEnc', u'locationEnc', u'locationV2Enc',
                 u'locationLatitude', u'locationLongitude', u'adjustmentType',
                 u'timeZoneOffset', u'vidComplDurValue', u'vidComplDurScale',
-                u'vidComplDispValue', u'vidComplDispScale',
+                # goal: export it in a way that can be reimported
+                # adjustedMediaMetaDataEnc ends up in the MR, not AR!!
+                # adjustmentSimpleDataEnc seems to be what's mostly in the AAE sidecar
+                # https://web.archive.org/web/20210617192902/https://rae.tnir.org/archives/2016/02/data-inside-apples-aae-files
+                # todo: https://github.com/RhetTbull/osxphotos/issues/150
+                # https://github.com/neilpa/photohack/issues/4
+                #  https://stackoverflow.com/questions/61023739/decoding-adjustmentdata-in-aae-files-of-pictures-taken-by-the-iphone
+                u'vidComplDispValue', u'vidComplDispScale',u'facesVersion',u'people',u'mediaMetaDataEnc',
                 u'keywordsEnc',u'extendedDescEnc',u'adjustedMediaMetaDataEnc',u'adjustmentSimpleDataEnc',
                 u'vidComplVisibilityState', u'customRenderedValue',
                 u'containerId', u'itemId', u'position', u'isKeyAsset'

@@ -53,16 +53,16 @@ def generate_xmp_file(
             logger.info(f"Not overwriting XMP file {sidecar_path} due to parser error: {e}")
 
     # decode asset record fields
-    # for k in asset_record['fields']:
-    #    if asset_record["fields"][k]['type'] == "ENCRYPTED_BYTES":
-    # try:
-    #     asset_record["fields"][k]['decoded'] = plistlib.loads(base64.b64decode(asset_record['fields'][k]['value']), fmt=plistlib.FMT_BINARY)
-    # except plistlib.InvalidFileException:
-    #     try:
-    #         asset_record["fields"][k]['decoded'] =  json.loads(zlib.decompress(base64.b64decode(asset_record['fields'][k]['value']),-zlib.MAX_WBITS))
-    #     except Exception as e:
-    #         asset_record["fields"][k]['decoded'] = base64.b64decode(asset_record['fields'][k]['value']).decode("utf-8")
-    # json.dump(asset_record["fields"],         open(download_path + ".ar.json", "w"),         indent=4,        default=str,        sort_keys=True)
+    for k in asset_record['fields']:
+       if asset_record["fields"][k]['type'] == "ENCRYPTED_BYTES":
+        try:
+            asset_record["fields"][k]['decoded'] = plistlib.loads(base64.b64decode(asset_record['fields'][k]['value']), fmt=plistlib.FMT_BINARY)
+        except plistlib.InvalidFileException:
+            try:
+                asset_record["fields"][k]['decoded'] =  json.loads(zlib.decompress(base64.b64decode(asset_record['fields'][k]['value']),-zlib.MAX_WBITS))
+            except Exception as e:
+                asset_record["fields"][k]['decoded'] = base64.b64decode(asset_record['fields'][k]['value']).decode("utf-8")
+    json.dump(asset_record["fields"],         open(download_path + ".ar.json", "w"),         indent=4,        default=str,        sort_keys=True)
 
     if can_write_file:
         xmp_metadata: XMPMetadata = build_metadata(asset_record)
