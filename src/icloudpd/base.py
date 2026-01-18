@@ -45,6 +45,7 @@ from icloudpd.config import GlobalConfig, UserConfig
 from icloudpd.counter import Counter
 from icloudpd.email_notifications import send_2sa_notification
 from icloudpd.filename_policies import build_filename_with_policies, create_filename_builder
+from icloudpd.lockfile import LockfileError, acquire_lock
 from icloudpd.log_level import LogLevel
 from icloudpd.mfa_provider import MFAProvider
 from icloudpd.password_provider import PasswordProvider
@@ -322,142 +323,166 @@ def _process_all_users_once(
     shared_status_exchange.set_user_configs(user_configs)
 
     for user_config in user_configs:
-        with logging_redirect_tqdm():
-            # Use shared status exchange instead of creating new ones per user
-            status_exchange = shared_status_exchange
-
-            # Set up password providers with proper function replacements
-            password_providers_dict: Dict[
-                PasswordProvider, Tuple[Callable[[str], str | None], Callable[[str, str], None]]
-            ] = {}
-
-            for provider in global_config.password_providers:
-                if provider == PasswordProvider.WEBUI:
-                    password_providers_dict[provider] = (
-                        partial(get_password_from_webui, logger, status_exchange),
-                        partial(update_password_status_in_webui, status_exchange),
-                    )
-                elif provider == PasswordProvider.CONSOLE:
-                    password_providers_dict[provider] = (
-                        ask_password_in_console,
-                        dummy_password_writter,
-                    )
-                elif provider == PasswordProvider.KEYRING:
-                    password_providers_dict[provider] = (
-                        get_password_from_keyring,
-                        keyring_password_writter(logger),
-                    )
-                elif provider == PasswordProvider.PARAMETER:
-
-                    def create_constant_password_provider(
-                        password: str | None,
-                    ) -> Callable[[str], str | None]:
-                        def password_provider(_username: str) -> str | None:
-                            return password
-
-                        return password_provider
-
-                    password_providers_dict[provider] = (
-                        create_constant_password_provider(user_config.password),
-                        dummy_password_writter,
-                    )
-
-            # Only set current user - global config and user configs are already set
-            status_exchange.set_current_user(user_config.username)
-
-            # Web server is now started once outside the user loop - no need to start it here
-
-            # Set up filename processors directly since we don't have click context
-            # filename_cleaner was removed from services and should be passed explicitly to functions that need it
-
-            # Set up live photo filename generator directly
-            lp_filename_generator = (
-                lp_filename_original
-                if user_config.live_photo_mov_filename_policy == LivePhotoMovFilenamePolicy.ORIGINAL
-                else lp_filename_concatinator
-            )
-
-            # Set up filename cleaner based on user preference
-            filename_cleaner = build_filename_cleaner(user_config.keep_unicode_in_filenames)
-
-            # Create filename builder with pre-configured policy and cleaner
-            filename_builder = create_filename_builder(
-                user_config.file_match_policy, filename_cleaner
-            )
-
-            # Set up function builders
-            passer = partial(
-                where_builder,
-                logger,
-                user_config.skip_videos,
-                user_config.skip_created_before,
-                user_config.skip_created_after,
-                user_config.skip_photos,
-                filename_builder,
-            )
-
-            downloader = (
-                partial(
-                    download_builder,
-                    logger,
-                    user_config.folder_structure,
-                    user_config.directory,
-                    user_config.sizes,
-                    user_config.force_size,
-                    global_config.only_print_filenames,
-                    user_config.set_exif_datetime,
-                    user_config.skip_live_photos,
-                    user_config.live_photo_size,
-                    user_config.dry_run,
-                    user_config.file_match_policy,
-                    user_config.xmp_sidecar,
-                    lp_filename_generator,
-                    filename_builder,
-                    user_config.align_raw,
-                )
-                if user_config.directory is not None
-                else (lambda _s, _c, _p: False)
-            )
-
-            notificator = partial(
-                notificator_builder,
-                logger,
+        # Try to acquire lock for this user to prevent parallel execution
+        try:
+            with acquire_lock(
                 user_config.username,
-                user_config.smtp_username,
-                user_config.smtp_password,
-                user_config.smtp_host,
-                user_config.smtp_port,
-                user_config.smtp_no_tls,
-                user_config.notification_email,
-                user_config.notification_email_from,
-                str(user_config.notification_script) if user_config.notification_script else None,
-            )
-
-            # Use core_single_run since we've disabled watch at this level
-            logger.info(f"Processing user: {user_config.username}")
-            result = core_single_run(
+                user_config.cookie_directory,
                 logger,
-                status_exchange,
-                global_config,
-                user_config,
-                password_providers_dict,
-                passer,
-                downloader,
-                notificator,
-                lp_filename_generator,
-            )
+            ):
+                result = _process_single_user(
+                    global_config, user_config, logger, shared_status_exchange
+                )
 
-            # If any user config fails and we're not in watch mode, return the error code
-            if result != 0:
-                if not global_config.watch_with_interval:
-                    return result
-                else:
-                    # In watch mode, log error and continue with next user
-                    logger.error(
-                        f"Error processing user {user_config.username}, continuing with next user..."
-                    )
+                # If any user config fails and we're not in watch mode, return the error code
+                if result != 0:
+                    if not global_config.watch_with_interval:
+                        return result
+                    else:
+                        # In watch mode, log error and continue with next user
+                        logger.error(
+                            f"Error processing user {user_config.username}, continuing with next user..."
+                        )
+        except LockfileError:
+            # Another instance is running for this user, skip
+            if not global_config.watch_with_interval:
+                return 1
+            # In watch mode, continue with next user
 
     return 0
+
+
+def _process_single_user(
+    global_config: GlobalConfig,
+    user_config: UserConfig,
+    logger: logging.Logger,
+    shared_status_exchange: StatusExchange,
+) -> int:
+    """Process a single user config (called within the lockfile context)"""
+    with logging_redirect_tqdm():
+        # Use shared status exchange instead of creating new ones per user
+        status_exchange = shared_status_exchange
+
+        # Set up password providers with proper function replacements
+        password_providers_dict: Dict[
+            PasswordProvider, Tuple[Callable[[str], str | None], Callable[[str, str], None]]
+        ] = {}
+
+        for provider in global_config.password_providers:
+            if provider == PasswordProvider.WEBUI:
+                password_providers_dict[provider] = (
+                    partial(get_password_from_webui, logger, status_exchange),
+                    partial(update_password_status_in_webui, status_exchange),
+                )
+            elif provider == PasswordProvider.CONSOLE:
+                password_providers_dict[provider] = (
+                    ask_password_in_console,
+                    dummy_password_writter,
+                )
+            elif provider == PasswordProvider.KEYRING:
+                password_providers_dict[provider] = (
+                    get_password_from_keyring,
+                    keyring_password_writter(logger),
+                )
+            elif provider == PasswordProvider.PARAMETER:
+
+                def create_constant_password_provider(
+                    password: str | None,
+                ) -> Callable[[str], str | None]:
+                    def password_provider(_username: str) -> str | None:
+                        return password
+
+                    return password_provider
+
+                password_providers_dict[provider] = (
+                    create_constant_password_provider(user_config.password),
+                    dummy_password_writter,
+                )
+
+        # Only set current user - global config and user configs are already set
+        status_exchange.set_current_user(user_config.username)
+
+        # Web server is now started once outside the user loop - no need to start it here
+
+        # Set up filename processors directly since we don't have click context
+        # filename_cleaner was removed from services and should be passed explicitly to functions that need it
+
+        # Set up live photo filename generator directly
+        lp_filename_generator = (
+            lp_filename_original
+            if user_config.live_photo_mov_filename_policy == LivePhotoMovFilenamePolicy.ORIGINAL
+            else lp_filename_concatinator
+        )
+
+        # Set up filename cleaner based on user preference
+        filename_cleaner = build_filename_cleaner(user_config.keep_unicode_in_filenames)
+
+        # Create filename builder with pre-configured policy and cleaner
+        filename_builder = create_filename_builder(
+            user_config.file_match_policy, filename_cleaner
+        )
+
+        # Set up function builders
+        passer = partial(
+            where_builder,
+            logger,
+            user_config.skip_videos,
+            user_config.skip_created_before,
+            user_config.skip_created_after,
+            user_config.skip_photos,
+            filename_builder,
+        )
+
+        downloader = (
+            partial(
+                download_builder,
+                logger,
+                user_config.folder_structure,
+                user_config.directory,
+                user_config.sizes,
+                user_config.force_size,
+                global_config.only_print_filenames,
+                user_config.set_exif_datetime,
+                user_config.skip_live_photos,
+                user_config.live_photo_size,
+                user_config.dry_run,
+                user_config.file_match_policy,
+                user_config.xmp_sidecar,
+                lp_filename_generator,
+                filename_builder,
+                user_config.align_raw,
+            )
+            if user_config.directory is not None
+            else (lambda _s, _c, _p: False)
+        )
+
+        notificator = partial(
+            notificator_builder,
+            logger,
+            user_config.username,
+            user_config.smtp_username,
+            user_config.smtp_password,
+            user_config.smtp_host,
+            user_config.smtp_port,
+            user_config.smtp_no_tls,
+            user_config.notification_email,
+            user_config.notification_email_from,
+            str(user_config.notification_script) if user_config.notification_script else None,
+        )
+
+        # Use core_single_run since we've disabled watch at this level
+        logger.info(f"Processing user: {user_config.username}")
+        return core_single_run(
+            logger,
+            status_exchange,
+            global_config,
+            user_config,
+            password_providers_dict,
+            passer,
+            downloader,
+            notificator,
+            lp_filename_generator,
+        )
 
 
 def notificator_builder(
@@ -689,7 +714,7 @@ def download_builder(
                 print(download_path)
             else:
                 truncated_path = truncate_middle(download_path, 96)
-                logger.debug("Downloading %s...", truncated_path)
+                logger.debug("Downloading 1 %s...", truncated_path)
 
                 download_result = download.download_media(
                     logger,
@@ -788,7 +813,7 @@ def download_builder(
                         logger.debug("%s already exists", truncate_middle(lp_download_path, 96))
                 if not lp_file_exists:
                     truncated_path = truncate_middle(lp_download_path, 96)
-                    logger.debug("Downloading %s...", truncated_path)
+                    logger.debug("Downloading 2 %s...", truncated_path)
                     download_result = download.download_media(
                         logger,
                         dry_run,
@@ -1043,7 +1068,7 @@ def core_single_run(
                             else:
                                 photo_video_phrase = "photos and videos"
                         logger.info(
-                            ("Downloading %s %s %s to %s ..."),
+                            ("Downloading 3 %s %s %s to %s ..."),
                             photos_count_str,
                             ",".join([_s.value for _s in user_config.sizes]),
                             photo_video_phrase,
