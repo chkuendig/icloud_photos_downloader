@@ -138,6 +138,21 @@ def download_media(
 
             photo_response = photo.download(icloud.photos.session, version.url, current_size)
             if photo_response.ok:
+                # When resuming with Range: bytes=N-, Apple's CDN sometimes
+                # returns 200 OK with the *full* file rather than 206 Partial.
+                # Appending the full body to existing partial bytes corrupts
+                # the file (or skipping the prefix produces a body shifted by
+                # N bytes). Detect by status code and restart from scratch.
+                if append_mode and photo_response.status_code == 200:
+                    logger.debug(
+                        "Server ignored Range for %s; restarting from scratch",
+                        download_path,
+                    )
+                    try:
+                        os.unlink(temp_download_path)
+                    except OSError:
+                        pass
+                    append_mode = False
                 return download_local(
                     photo_response, temp_download_path, append_mode, download_path, photo.created
                 )
