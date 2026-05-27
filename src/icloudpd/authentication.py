@@ -256,6 +256,15 @@ def request_2fa_web(
             f"Expected NO_INPUT_NEEDED, but got {status_exchange.get_status()}"
         )
 
+    # Trigger push notification to trusted devices so a code is actually sent.
+    # Apple's auth flow (2026+) requires a PUT to /verify/trusteddevice/securitycode
+    # to initiate code delivery; without it the webui shows the entry form but no
+    # code ever arrives. Failure is non-fatal — a code may still arrive another way.
+    if not icloud.trigger_push_notification():
+        logger.debug("Failed to trigger 2FA push notification, continuing anyway")
+    else:
+        logger.debug("2FA push notification triggered")
+
     # wait for input
     while True:
         status = status_exchange.get_status()
